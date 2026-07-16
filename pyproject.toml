@@ -1,0 +1,56 @@
+[project]
+name = "hermes-provider-venice"
+version = "0.1.0"
+description = "Venice AI model provider plugin for Hermes Agent"
+readme = "README.md"
+authors = [
+    { name = "Joshua Mo", email = "joshua.mo.876@gmail.com" }
+]
+requires-python = ">=3.12"
+license = "MIT"
+license-files = ["LICENSE"]
+keywords = ["hermes", "hermes-agent", "venice", "llm", "provider"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Environment :: Console",
+    "Intended Audience :: Developers",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+]
+dependencies = []
+
+[project.urls]
+Homepage = "https://docs.venice.ai"
+Documentation = "https://docs.venice.ai"
+"Venice API" = "https://docs.venice.ai/api-reference/api-spec"
+
+[project.scripts]
+hermes-provider-venice = "hermes_provider_venice.__main__:main"
+
+[project.entry-points."hermes_agent.plugins"]
+venice = "hermes_provider_venice"
+
+[project.entry-points."hermes_agent.model_providers"]
+venice = "hermes_provider_venice:register"
+
+[build-system]
+requires = ["uv_build>=0.11.29,<0.12.0"]
+build-backend = "uv_build"
+
+[tool.uv.build-backend]
+source-include = [
+    "AGENTS.md",
+    "CONTRIBUTING.md",
+    "DEVELOPMENT.md",
+    "docs/**",
+    "tests/**",
+]
+
+[dependency-groups]
+dev = [
+    "pytest>=9.1.1",
+    "ruff>=0.15.21",
+]
