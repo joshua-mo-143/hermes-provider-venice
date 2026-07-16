@@ -23,7 +23,9 @@ classifiers = [
 dependencies = []
 
 [project.urls]
-Homepage = "https://docs.venice.ai"
+Homepage = "https://github.com/joshua-mo/hermes-provider-venice"
+Repository = "https://github.com/joshua-mo/hermes-provider-venice"
+Issues = "https://github.com/joshua-mo/hermes-provider-venice/issues"
 Documentation = "https://docs.venice.ai"
 "Venice API" = "https://docs.venice.ai/api-reference/api-spec"
 

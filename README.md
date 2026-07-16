@@ -13,9 +13,14 @@ registers a `venice` provider so Hermes can route chat through
 # From PyPI:
 pip install hermes-provider-venice
 
+# From the latest GitHub main branch:
+pip install "git+https://github.com/joshua-mo/hermes-provider-venice.git@main"
+
 # Or from this checkout:
 pip install .
 ```
+
+For a reproducible GitHub installation, replace `main` with a release tag.
 
 For Hermes releases without native packaged-provider discovery, or when the
 package is installed outside Hermes's environment, run the compatibility
