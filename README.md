@@ -88,6 +88,7 @@ Full catalog: `https://api.venice.ai/api/v1/models?type=text` or
 - Passes `prompt_cache_key` from the Hermes session id for better cache
   locality
 - Filters the live catalog to online, text, tool-capable models
+- Resolves each model's context window from Venice's live catalog
 - Maps Hermes reasoning controls to Venice's recommended disable and
   model-supported effort parameters, clamping unsupported effort levels
 

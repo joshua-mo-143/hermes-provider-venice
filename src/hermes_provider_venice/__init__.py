@@ -11,7 +11,10 @@ from __future__ import annotations
 
 import os
 import time
+from decimal import Decimal, InvalidOperation
+from functools import wraps
 from typing import Any
+from urllib.parse import urlparse
 
 __version__ = "0.1.0"
 
@@ -38,6 +41,50 @@ _REASONING_EFFORT_ORDER = (
 
 def _catalog_key(base_url: str) -> str:
     return base_url.strip().rstrip("/")
+
+
+def _is_venice_endpoint(base_url: str) -> bool:
+    normalized = _catalog_key(base_url)
+    configured = _catalog_key(os.environ.get("VENICE_BASE_URL", ""))
+    if configured and normalized == configured:
+        return True
+    try:
+        hostname = (urlparse(normalized).hostname or "").lower()
+    except ValueError:
+        return False
+    return hostname == "venice.ai" or hostname.endswith(".venice.ai")
+
+
+def _price_per_token(value: Any) -> str | None:
+    if isinstance(value, dict):
+        value = value.get("usd")
+    if value is None or isinstance(value, bool):
+        return None
+    try:
+        price = Decimal(str(value)) / Decimal(1_000_000)
+    except (InvalidOperation, TypeError, ValueError):
+        return None
+    return format(price, "f")
+
+
+def _parse_pricing(model_spec: dict[str, Any]) -> dict[str, str]:
+    raw_pricing = model_spec.get("pricing")
+    if not isinstance(raw_pricing, dict):
+        return {}
+
+    key_map = {
+        "input": "prompt",
+        "output": "completion",
+        "cache_input": "cache_read",
+        "cache_write": "cache_write",
+        "cache_output": "cache_write",
+    }
+    pricing: dict[str, str] = {}
+    for source, target in key_map.items():
+        value = _price_per_token(raw_pricing.get(source))
+        if value is not None:
+            pricing[target] = value
+    return pricing
 
 
 def _parse_catalog(payload: Any) -> dict[str, dict[str, Any]]:
@@ -72,6 +119,7 @@ def _parse_catalog(payload: Any) -> dict[str, dict[str, Any]]:
             "context_length": raw_model.get("context_length")
             or model_spec.get("availableContextTokens"),
             "max_completion_tokens": model_spec.get("maxCompletionTokens"),
+            "pricing": _parse_pricing(model_spec),
         }
         normalized_id = model_id.strip()
         catalog[normalized_id] = metadata
@@ -128,6 +176,7 @@ else:
             api_key: str | None = None,
             base_url: str | None = None,
             timeout: float = 8.0,
+            force_refresh: bool = False,
         ) -> dict[str, dict[str, Any]] | None:
             effective_base = _catalog_key(base_url or self.base_url or "")
             if not effective_base:
@@ -139,6 +188,7 @@ else:
                 cached
                 and now - cached[0] < _CATALOG_TTL_SECONDS
                 and (cached[1] or not api_key)
+                and not force_refresh
             ):
                 return cached[1]
 
@@ -247,6 +297,44 @@ else:
                 is True
             ] or None
 
+    def _install_context_lookup_patch() -> None:
+        """Teach current Hermes releases to resolve live Venice context limits."""
+        try:
+            import agent.models_dev as models_dev
+        except ImportError:
+            return
+
+        original = getattr(models_dev, "lookup_models_dev_context", None)
+        if not callable(original):
+            return
+        if getattr(original, "_hermes_venice_context_patch", False):
+            return
+
+        @wraps(original)
+        def lookup_models_dev_context(provider: str, model: str) -> int | None:
+            if provider.lower() in {
+                "venice",
+                "venice-ai",
+                "veniceai",
+                "venice.ai",
+                "api.venice.ai",
+            }:
+                metadata = venice._model_metadata(
+                    model,
+                    base_url=os.environ.get("VENICE_BASE_URL") or venice.base_url,
+                )
+                context_length = metadata.get("context_length") if metadata else None
+                if (
+                    isinstance(context_length, int)
+                    and not isinstance(context_length, bool)
+                    and context_length > 0
+                ):
+                    return context_length
+            return original(provider, model)
+
+        lookup_models_dev_context._hermes_venice_context_patch = True
+        models_dev.lookup_models_dev_context = lookup_models_dev_context
+
     venice = VeniceProfile(
         name="venice",
         aliases=("venice-ai", "veniceai", "venice.ai", "api.venice.ai"),
@@ -291,6 +379,7 @@ else:
 
     # Directory plugins are registered by importing their __init__.py.
     register_provider(venice)
+    _install_context_lookup_patch()
 
 
 def register(_context: object | None = None) -> None:
@@ -306,6 +395,7 @@ def register(_context: object | None = None) -> None:
             "same Python environment as Hermes Agent."
         )
     register_provider(venice)
+    _install_context_lookup_patch()
 
 
 __all__ = ("__version__", "register", "venice")

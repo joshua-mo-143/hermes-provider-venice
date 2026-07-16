@@ -74,7 +74,12 @@ def test_fetch_models_filters_non_text_and_offline_entries(
                 "type": "text",
                 "model_spec": {
                     "capabilities": {"supportsFunctionCalling": True},
+                    "pricing": {
+                        "input": {"usd": 1.5},
+                        "output": {"usd": 4.0},
+                    },
                 },
+                "context_length": 1_000_000,
             },
             {
                 "id": "offline-text",
@@ -111,6 +116,15 @@ def test_fetch_models_filters_non_text_and_offline_entries(
     monkeypatch.setitem(sys.modules, "hermes_cli.urllib_security", security)
 
     assert module.venice.fetch_models(api_key="secret") == ["online-text"]
+    assert module.venice._model_metadata("online-text") == {
+        "capabilities": {"supportsFunctionCalling": True},
+        "context_length": 1_000_000,
+        "max_completion_tokens": None,
+        "pricing": {
+            "prompt": "0.0000015",
+            "completion": "0.000004",
+        },
+    }
 
 
 def test_reasoning_uses_supported_effort_and_clamps(plugin) -> None:
@@ -155,6 +169,37 @@ def test_reasoning_disable_uses_venice_recommended_shape(plugin) -> None:
         model="any-model",
         reasoning_config={"enabled": True, "effort": "none"},
     ) == ({"reasoning": {"enabled": False}}, {})
+
+
+def test_context_metadata_patch_is_scoped_to_venice(
+    plugin, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    module, _ = plugin
+    models_dev = types.ModuleType("agent.models_dev")
+    models_dev.lookup_models_dev_context = lambda *_args, **_kwargs: 123_456
+    agent = types.ModuleType("agent")
+    agent.models_dev = models_dev
+    monkeypatch.setitem(sys.modules, "agent", agent)
+    monkeypatch.setitem(sys.modules, "agent.models_dev", models_dev)
+
+    expected = {
+        "test-model": {
+            "capabilities": {"supportsFunctionCalling": True},
+            "context_length": 500_000,
+            "max_completion_tokens": 32_000,
+            "pricing": {},
+        }
+    }
+    module._catalog_cache[module.venice.base_url] = (
+        module.time.monotonic(),
+        expected,
+    )
+    module._install_context_lookup_patch()
+
+    assert models_dev.lookup_models_dev_context("venice", "test-model") == 500_000
+    assert (
+        models_dev.lookup_models_dev_context("other-provider", "test-model") == 123_456
+    )
 
 
 def test_distribution_exposes_both_discovery_entry_points() -> None:
