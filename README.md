@@ -7,6 +7,9 @@ Venice has a privacy-first OpenAI-compatible inference API. This package
 registers a `venice` provider so Hermes can route chat through
 `https://api.venice.ai/api/v1`.
 
+> **Disclaimer:** This is an independent, open source project. It is not
+> officially maintained, endorsed, or supported by Venice AI.
+
 ## Install
 
 ```bash
