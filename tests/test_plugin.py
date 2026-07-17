@@ -171,6 +171,273 @@ def test_reasoning_disable_uses_venice_recommended_shape(plugin) -> None:
     ) == ({"reasoning": {"enabled": False}}, {})
 
 
+def test_reasoning_effort_options_reflect_live_catalog(plugin) -> None:
+    module, _ = plugin
+    module._catalog_cache[module.venice.base_url] = (
+        module.time.monotonic(),
+        {
+            "effort-model": {
+                "capabilities": {
+                    "supportsReasoning": True,
+                    "supportsReasoningEffort": True,
+                    "reasoningEffortOptions": ["low", "LOW", "medium", "bogus"],
+                }
+            },
+            "fixed-reasoning-model": {
+                "capabilities": {
+                    "supportsReasoning": True,
+                    "supportsReasoningEffort": False,
+                }
+            },
+        },
+    )
+
+    assert module.venice.reasoning_effort_options("effort-model") == [
+        "low",
+        "medium",
+    ]
+    assert module.venice.reasoning_effort_options("fixed-reasoning-model") == []
+    assert module.venice.reasoning_effort_options("unknown-model") == []
+
+
+def _install_fake_usage_pricing(monkeypatch: pytest.MonkeyPatch):
+    from dataclasses import dataclass
+    from decimal import Decimal
+    from typing import Optional
+
+    @dataclass(frozen=True)
+    class PricingEntry:
+        input_cost_per_million: Optional[Decimal] = None
+        output_cost_per_million: Optional[Decimal] = None
+        cache_read_cost_per_million: Optional[Decimal] = None
+        cache_write_cost_per_million: Optional[Decimal] = None
+        request_cost: Optional[Decimal] = None
+        source: str = "none"
+        source_url: Optional[str] = None
+        pricing_version: Optional[str] = None
+        fetched_at: object = None
+
+    fallback_calls: list[tuple] = []
+
+    def original_get_pricing_entry(
+        model_name, provider=None, base_url=None, api_key=None
+    ):
+        fallback_calls.append((model_name, provider, base_url, api_key))
+        return None
+
+    usage_pricing = types.ModuleType("agent.usage_pricing")
+    usage_pricing.PricingEntry = PricingEntry
+    usage_pricing.get_pricing_entry = original_get_pricing_entry
+
+    agent = sys.modules.get("agent") or types.ModuleType("agent")
+    agent.usage_pricing = usage_pricing
+    monkeypatch.setitem(sys.modules, "agent", agent)
+    monkeypatch.setitem(sys.modules, "agent.usage_pricing", usage_pricing)
+    return usage_pricing, fallback_calls, Decimal
+
+
+def test_pricing_patch_injects_live_venice_rates(
+    plugin, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    module, _ = plugin
+    usage_pricing, fallback_calls, Decimal = _install_fake_usage_pricing(monkeypatch)
+
+    module._catalog_cache[module.venice.base_url] = (
+        module.time.monotonic(),
+        {
+            "priced-model": {
+                "capabilities": {"supportsFunctionCalling": True},
+                "context_length": 131_072,
+                "max_completion_tokens": None,
+                # Per-token strings, as stored by _parse_pricing: 0.7 / 2.8 /
+                # 0.35 USD per million tokens for input / output / cache read.
+                "pricing": {
+                    "prompt": "0.0000007",
+                    "completion": "0.0000028",
+                    "cache_read": "0.00000035",
+                },
+            }
+        },
+    )
+    module._install_pricing_lookup_patch()
+
+    entry = usage_pricing.get_pricing_entry("priced-model", provider="venice")
+    assert entry.input_cost_per_million == Decimal("0.7")
+    assert entry.output_cost_per_million == Decimal("2.8")
+    assert entry.cache_read_cost_per_million == Decimal("0.35")
+    assert entry.cache_write_cost_per_million is None
+    assert entry.source == "provider_models_api"
+    assert entry.pricing_version == "venice-models-api"
+    assert fallback_calls == []
+
+
+def test_pricing_patch_is_scoped_to_venice(
+    plugin, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    module, _ = plugin
+    usage_pricing, fallback_calls, _ = _install_fake_usage_pricing(monkeypatch)
+
+    module._catalog_cache[module.venice.base_url] = (
+        module.time.monotonic(),
+        {
+            "priced-model": {
+                "capabilities": {"supportsFunctionCalling": True},
+                "context_length": 131_072,
+                "max_completion_tokens": None,
+                "pricing": {"prompt": "0.0000007", "completion": "0.0000028"},
+            }
+        },
+    )
+    module._install_pricing_lookup_patch()
+
+    # Unknown model on a Venice route falls through to Hermes' resolver.
+    assert usage_pricing.get_pricing_entry("mystery", provider="venice") is None
+    # Other providers are never intercepted.
+    assert usage_pricing.get_pricing_entry("priced-model", provider="openai") is None
+    assert ("mystery", "venice", None, None) in fallback_calls
+    assert ("priced-model", "openai", None, None) in fallback_calls
+
+
+def test_pricing_patch_is_idempotent(plugin, monkeypatch: pytest.MonkeyPatch) -> None:
+    module, _ = plugin
+    usage_pricing, _, _ = _install_fake_usage_pricing(monkeypatch)
+
+    module._install_pricing_lookup_patch()
+    patched = usage_pricing.get_pricing_entry
+    module._install_pricing_lookup_patch()
+
+    assert usage_pricing.get_pricing_entry is patched
+
+
+def test_picker_pricing_patch_exposes_catalog_pricing(
+    plugin, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    module, _ = plugin
+
+    fallback_calls: list[tuple] = []
+
+    def original_get_pricing_for_provider(provider, *, force_refresh=False):
+        fallback_calls.append((provider, force_refresh))
+        return {}
+
+    cli_models = types.ModuleType("hermes_cli.models")
+    cli_models.get_pricing_for_provider = original_get_pricing_for_provider
+    hermes_cli = sys.modules.get("hermes_cli") or types.ModuleType("hermes_cli")
+    hermes_cli.models = cli_models
+    monkeypatch.setitem(sys.modules, "hermes_cli", hermes_cli)
+    monkeypatch.setitem(sys.modules, "hermes_cli.models", cli_models)
+
+    module._catalog_cache[module.venice.base_url] = (
+        module.time.monotonic(),
+        {
+            "priced-model": {
+                "capabilities": {"supportsFunctionCalling": True},
+                "context_length": 131_072,
+                "max_completion_tokens": None,
+                "pricing": {
+                    "prompt": "0.0000007",
+                    "completion": "0.0000028",
+                    "cache_read": "0.00000035",
+                },
+            },
+            "unpriced-model": {
+                "capabilities": {"supportsFunctionCalling": True},
+                "context_length": 65_536,
+                "max_completion_tokens": None,
+                "pricing": {},
+            },
+        },
+    )
+    module._install_picker_pricing_patch()
+
+    pricing = cli_models.get_pricing_for_provider("venice")
+    assert pricing == {
+        "priced-model": {
+            "prompt": "0.0000007",
+            "completion": "0.0000028",
+            "input_cache_read": "0.00000035",
+        }
+    }
+    assert fallback_calls == []
+
+    # Other providers fall through to Hermes' native pricing resolution.
+    assert cli_models.get_pricing_for_provider("openrouter") == {}
+    assert ("openrouter", False) in fallback_calls
+
+
+def test_capabilities_patch_maps_venice_reasoning(
+    plugin, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    module, _ = plugin
+    from dataclasses import dataclass
+
+    @dataclass
+    class ModelCapabilities:
+        supports_tools: bool = True
+        supports_vision: bool = False
+        supports_reasoning: bool = False
+        context_window: int = 200000
+        max_output_tokens: int = 8192
+        model_family: str = ""
+
+    fallback_calls: list[tuple] = []
+
+    def original_get_model_capabilities(provider, model):
+        fallback_calls.append((provider, model))
+        return None
+
+    models_dev = types.ModuleType("agent.models_dev")
+    models_dev.ModelCapabilities = ModelCapabilities
+    models_dev.get_model_capabilities = original_get_model_capabilities
+    agent = sys.modules.get("agent") or types.ModuleType("agent")
+    agent.models_dev = models_dev
+    monkeypatch.setitem(sys.modules, "agent", agent)
+    monkeypatch.setitem(sys.modules, "agent.models_dev", models_dev)
+
+    module._catalog_cache[module.venice.base_url] = (
+        module.time.monotonic(),
+        {
+            "reasoner": {
+                "capabilities": {
+                    "supportsFunctionCalling": True,
+                    "supportsReasoning": True,
+                    "supportsVision": True,
+                },
+                "context_length": 262_144,
+                "max_completion_tokens": 32_000,
+                "pricing": {},
+            },
+            "non-reasoner": {
+                "capabilities": {
+                    "supportsFunctionCalling": True,
+                    "supportsReasoning": False,
+                },
+                "context_length": 128_000,
+                "max_completion_tokens": None,
+                "pricing": {},
+            },
+        },
+    )
+    module._install_capabilities_patch()
+
+    reasoner = models_dev.get_model_capabilities("venice", "reasoner")
+    assert reasoner.supports_reasoning is True
+    assert reasoner.supports_vision is True
+    assert reasoner.supports_tools is True
+    assert reasoner.context_window == 262_144
+    assert reasoner.max_output_tokens == 32_000
+
+    plain = models_dev.get_model_capabilities("venice", "non-reasoner")
+    assert plain.supports_reasoning is False
+    assert plain.context_window == 128_000
+    # Unknown output cap keeps the dataclass default.
+    assert plain.max_output_tokens == 8192
+
+    # Non-venice providers still resolve through models.dev.
+    assert models_dev.get_model_capabilities("openai", "gpt-4o") is None
+    assert ("openai", "gpt-4o") in fallback_calls
+
+
 def test_context_metadata_patch_is_scoped_to_venice(
     plugin, monkeypatch: pytest.MonkeyPatch
 ) -> None:

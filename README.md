@@ -1,14 +1,10 @@
 # hermes-provider-venice
 
-[Venice AI](https://docs.venice.ai) model provider plugin for
-[Hermes Agent](https://github.com/NousResearch/hermes-agent).
+[Venice AI](https://docs.venice.ai) model provider plugin for [Hermes Agent](https://github.com/NousResearch/hermes-agent).
 
-Venice has a privacy-first OpenAI-compatible inference API. This package
-registers a `venice` provider so Hermes can route chat through
-`https://api.venice.ai/api/v1`.
+Venice has a privacy-first OpenAI-compatible inference API. This package registers a `venice` provider so Hermes can route chat through `https://api.venice.ai/api/v1`.
 
-> **Disclaimer:** This is an independent, open source project. It is not
-> officially maintained, endorsed, or supported by Venice AI.
+> **Disclaimer:** This is an independent, open source project. It is not officially maintained, endorsed, or supported by Venice AI.
 
 ## Install
 
@@ -25,19 +21,13 @@ pip install .
 
 For a reproducible GitHub installation, replace `main` with a release tag.
 
-For Hermes releases without native packaged-provider discovery, or when the
-package is installed outside Hermes's environment, run the compatibility
-installer:
+For Hermes releases without native packaged-provider discovery, or when the package is installed outside Hermes's environment, run the compatibility installer:
 
 ```bash
 hermes-provider-venice install
 ```
 
-The package exposes both the current `hermes_agent.plugins` entry point and the
-dedicated `hermes_agent.model_providers` entry point. Hermes releases with
-native packaged-provider discovery load it automatically when it is installed
-in the same Python environment as Hermes. The compatibility command copies the
-same profile to `$HERMES_HOME/plugins/model-providers/venice`.
+The package exposes both the current `hermes_agent.plugins` entry point and the dedicated `hermes_agent.model_providers` entry point. Hermes releases with native packaged-provider discovery load it automatically when it is installed in the same Python environment as Hermes. The compatibility command copies the same profile to `$HERMES_HOME/plugins/model-providers/venice`.
 
 Add your API key (create one at [https://venice.ai/settings/api](https://venice.ai/settings/api)):
 
@@ -60,9 +50,7 @@ model:
   default: zai-org-glm-5-2
 ```
 
-The live picker fetches `GET /models?type=text` and filters out offline,
-non-text, and non-tool-capable models. If that fails, these curated fallbacks
-are used (refreshed 2026-07-16 from the Venice catalog):
+The live picker fetches `GET /models?type=text` and filters out offline, non-text, and non-tool-capable models. If that fails, these curated fallbacks are used (refreshed 2026-07-16 from the Venice catalog):
 
 | Role                 | Model ID                                                 |
 | -------------------- | -------------------------------------------------------- |
@@ -79,26 +67,23 @@ are used (refreshed 2026-07-16 from the Venice catalog):
 | Vision               | `qwen3-vl-235b-a22b`                                     |
 | Fast / aux           | `deepseek-v4-flash`                                      |
 
-Full catalog: `https://api.venice.ai/api/v1/models?type=text` or
-[https://docs.venice.ai](https://docs.venice.ai)
+Full catalog: `https://api.venice.ai/api/v1/models?type=text` or [https://docs.venice.ai](https://docs.venice.ai)
 
 ## What the profile does
 
 - `auth_type: api_key` via `VENICE_API_KEY`
 - Optional `VENICE_BASE_URL` override
-- Sets `venice_parameters.include_venice_system_prompt: false` so Hermes's
-  system prompt is not appended to Venice's defaults
-- Passes `prompt_cache_key` from the Hermes session id for better cache
-  locality
+- Sets `venice_parameters.include_venice_system_prompt: false` so Hermes's system prompt is not appended to Venice's defaults
+- Passes `prompt_cache_key` from the Hermes session id for better cache locality
 - Filters the live catalog to online, text, tool-capable models
 - Resolves each model's context window from Venice's live catalog
-- Maps Hermes reasoning controls to Venice's recommended disable and
-  model-supported effort parameters, clamping unsupported effort levels
+- Injects live per-token pricing from Venice's catalog into Hermes's cost tracking so session cost, the expensive-model guard, and usage reports work for Venice models (Venice reports per-million USD rates that Hermes's generic OpenAI-compatible pricing parser cannot read)
+- Surfaces the same live pricing and per-model capabilities (reasoning, tools, vision, context) in Hermes's model pickers, including the desktop UI's price column and reasoning toggle
+- Maps Hermes reasoning controls to Venice's recommended disable and model-supported effort parameters, clamping unsupported effort levels and omitting effort entirely for models that reason with a fixed budget
 
 ## Develop
 
-See [`DEVELOPMENT.md`](DEVELOPMENT.md) for setup, checks, local Hermes
-integration, and live API testing.
+See [`DEVELOPMENT.md`](DEVELOPMENT.md) for setup, checks, local Hermes integration, and live API testing.
 
 Contributions are described in [`CONTRIBUTING.md`](CONTRIBUTING.md).
 
