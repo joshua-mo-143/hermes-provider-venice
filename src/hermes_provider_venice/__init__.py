@@ -50,7 +50,7 @@ from functools import wraps
 from typing import Any
 from urllib.parse import urlparse
 
-__version__ = "0.1.0"
+__version__ = "0.2.0"
 
 _CATALOG_TTL_SECONDS = 300.0
 _catalog_cache: dict[str, tuple[float, dict[str, dict[str, Any]]]] = {}

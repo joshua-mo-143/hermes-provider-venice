@@ -1,5 +1,5 @@
 name: venice
 kind: model-provider
-version: 0.1.0
+version: 0.2.0
 description: Venice AI — Privacy-first, OpenAI-compatible inference
 author: Joshua Mo
