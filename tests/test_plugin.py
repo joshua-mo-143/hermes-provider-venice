@@ -514,3 +514,86 @@ def test_compatibility_installer_copies_plugin_files(
     assert (destination / "__init__.py").is_file()
     assert (destination / "plugin.yaml").is_file()
     assert not (destination / "__main__.py").exists()
+
+
+def test_update_upgrades_via_pip_from_pypi(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from hermes_provider_venice import __main__
+
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    calls: list[list[str]] = []
+
+    def fake_run(command, check):
+        calls.append(command)
+        return types.SimpleNamespace(returncode=0)
+
+    monkeypatch.setattr(__main__.subprocess, "run", fake_run)
+
+    __main__.update()
+
+    assert calls == [
+        [
+            sys.executable,
+            "-m",
+            "pip",
+            "install",
+            "--upgrade",
+            "hermes-provider-venice",
+        ]
+    ]
+    # Nothing installed in HERMES_HOME, so no directory copy is created.
+    assert not (tmp_path / "plugins").exists()
+
+
+def test_update_passes_pre_and_source(monkeypatch: pytest.MonkeyPatch) -> None:
+    from hermes_provider_venice import __main__
+
+    calls: list[list[str]] = []
+    monkeypatch.setattr(
+        __main__.subprocess,
+        "run",
+        lambda command, check: calls.append(command),
+    )
+
+    __main__.update(pre=True, source="git+https://example.com/pkg.git@main")
+
+    assert calls == [
+        [
+            sys.executable,
+            "-m",
+            "pip",
+            "install",
+            "--upgrade",
+            "--pre",
+            "git+https://example.com/pkg.git@main",
+        ]
+    ]
+
+
+def test_update_refreshes_existing_directory_install(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from hermes_provider_venice import __main__
+
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    __main__.install()
+
+    monkeypatch.setattr(__main__.subprocess, "run", lambda command, check: None)
+
+    __main__.update()
+
+    destination = tmp_path / "plugins" / "model-providers" / "venice"
+    assert (destination / "__init__.py").is_file()
+
+
+def test_update_reports_pip_failure(monkeypatch: pytest.MonkeyPatch) -> None:
+    from hermes_provider_venice import __main__
+
+    def fake_run(command, check):
+        raise __main__.subprocess.CalledProcessError(returncode=2, cmd=command)
+
+    monkeypatch.setattr(__main__.subprocess, "run", fake_run)
+
+    with pytest.raises(RuntimeError, match="pip failed to upgrade"):
+        __main__.update()
