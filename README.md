@@ -29,6 +29,14 @@ hermes-provider-venice install
 
 The package exposes both the current `hermes_agent.plugins` entry point and the dedicated `hermes_agent.model_providers` entry point. Hermes releases with native packaged-provider discovery load it automatically when it is installed in the same Python environment as Hermes. The compatibility command copies the same profile to `$HERMES_HOME/plugins/model-providers/venice`.
 
+To upgrade to the latest release later, run:
+
+```bash
+hermes-provider-venice update
+```
+
+This runs `pip install --upgrade` for the package in the current environment and, if the compatibility installer was used, refreshes the copy in `$HERMES_HOME`. Pass `--pre` to include pre-releases, or `--source "git+https://github.com/joshua-mo/hermes-provider-venice.git@main"` to update from GitHub. Restart Hermes afterwards to load the new version.
+
 Add your API key (create one at [https://venice.ai/settings/api](https://venice.ai/settings/api)):
 
 ```bash
