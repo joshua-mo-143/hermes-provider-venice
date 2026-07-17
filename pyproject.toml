@@ -1,6 +1,6 @@
 [project]
 name = "hermes-provider-venice"
-version = "0.2.0"
+version = "0.2.1"
 description = "Venice AI model provider plugin for Hermes Agent"
 readme = "README.md"
 authors = [
