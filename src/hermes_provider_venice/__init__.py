@@ -50,9 +50,11 @@ from functools import wraps
 from typing import Any
 from urllib.parse import urlparse
 
-__version__ = "0.2.1"
+__version__ = "0.2.2"
 
 _CATALOG_TTL_SECONDS = 300.0
+# The live text catalog is under 200 KB; anything far larger is not a catalog.
+_MAX_CATALOG_BYTES = 8 * 1024 * 1024
 _catalog_cache: dict[str, tuple[float, dict[str, dict[str, Any]]]] = {}
 
 # Venice reports token prices per million tokens; Hermes stores catalog
@@ -102,6 +104,28 @@ def _is_venice_endpoint(base_url: str) -> bool:
     except ValueError:
         return False
     return hostname == "venice.ai" or hostname.endswith(".venice.ai")
+
+
+def _can_send_credentials(base_url: str) -> bool:
+    """Return ``True`` when an API key may be sent to *base_url*.
+
+    Requires HTTPS, except for loopback hosts, so a plain ``http://`` base URL
+    never carries the key across the network unencrypted.
+    """
+    try:
+        parsed = urlparse(base_url)
+    except ValueError:
+        return False
+    if parsed.scheme == "https":
+        return True
+    if parsed.scheme != "http":
+        return False
+    hostname = (parsed.hostname or "").lower()
+    return (
+        hostname in ("localhost", "::1")
+        or hostname.endswith(".localhost")
+        or hostname.startswith("127.")
+    )
 
 
 def _is_venice_provider(provider: str | None) -> bool:
@@ -263,12 +287,16 @@ else:
             Serves a cached catalog within :data:`_CATALOG_TTL_SECONDS` (an
             unauthenticated cached result is reused for authenticated callers,
             but not vice versa) and otherwise fetches ``GET /models?type=text``.
-            Network or parse failures are cached as empty and surface as
-            ``None`` so callers fall back to their defaults.
+            Network or parse failures, and responses over
+            :data:`_MAX_CATALOG_BYTES`, are cached as empty and surface as
+            ``None`` so callers fall back to their defaults. The API key is
+            only sent to HTTPS or loopback base URLs.
             """
             effective_base = _catalog_key(base_url or self.base_url or "")
             if not effective_base:
                 return None
+            if api_key and not _can_send_credentials(effective_base):
+                api_key = None
 
             cached = _catalog_cache.get(effective_base)
             now = time.monotonic()
@@ -294,7 +322,10 @@ else:
 
             try:
                 with open_credentialed_url(req, timeout=timeout) as resp:
-                    payload = json.loads(resp.read().decode("utf-8"))
+                    raw = resp.read(_MAX_CATALOG_BYTES + 1)
+                if len(raw) > _MAX_CATALOG_BYTES:
+                    raise ValueError("Venice catalog response is too large")
+                payload = json.loads(raw.decode("utf-8"))
             except Exception:
                 _catalog_cache[effective_base] = (now, {})
                 return None

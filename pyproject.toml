@@ -1,6 +1,6 @@
 [project]
 name = "hermes-provider-venice"
-version = "0.2.1"
+version = "0.2.2"
 description = "Venice AI model provider plugin for Hermes Agent"
 readme = "README.md"
 authors = [
@@ -23,9 +23,9 @@ classifiers = [
 dependencies = []
 
 [project.urls]
-Homepage = "https://github.com/joshua-mo/hermes-provider-venice"
-Repository = "https://github.com/joshua-mo/hermes-provider-venice"
-Issues = "https://github.com/joshua-mo/hermes-provider-venice/issues"
+Homepage = "https://github.com/joshua-mo-143/hermes-provider-venice"
+Repository = "https://github.com/joshua-mo-143/hermes-provider-venice"
+Issues = "https://github.com/joshua-mo-143/hermes-provider-venice/issues"
 Documentation = "https://docs.venice.ai"
 "Venice API" = "https://docs.venice.ai/api-reference/api-spec"
 

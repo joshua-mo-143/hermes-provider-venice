@@ -137,7 +137,7 @@ def main(argv: list[str] | None = None) -> None:
         metavar="SPEC",
         help=(
             "pip requirement to upgrade from instead of PyPI "
-            "(e.g. 'git+https://github.com/joshua-mo/"
+            "(e.g. 'git+https://github.com/joshua-mo-143/"
             "hermes-provider-venice.git@main')"
         ),
     )

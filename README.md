@@ -13,7 +13,7 @@ Venice has a privacy-first OpenAI-compatible inference API. This package registe
 pip install hermes-provider-venice
 
 # From the latest GitHub main branch:
-pip install "git+https://github.com/joshua-mo/hermes-provider-venice.git@main"
+pip install "git+https://github.com/joshua-mo-143/hermes-provider-venice.git@main"
 
 # Or from this checkout:
 pip install .
@@ -35,7 +35,7 @@ To upgrade to the latest release later, run:
 hermes-provider-venice update
 ```
 
-This runs `pip install --upgrade` for the package in the current environment and, if the compatibility installer was used, refreshes the copy in `$HERMES_HOME`. Pass `--pre` to include pre-releases, or `--source "git+https://github.com/joshua-mo/hermes-provider-venice.git@main"` to update from GitHub. Restart Hermes afterwards to load the new version.
+This runs `pip install --upgrade` for the package in the current environment and, if the compatibility installer was used, refreshes the copy in `$HERMES_HOME`. Pass `--pre` to include pre-releases, or `--source "git+https://github.com/joshua-mo-143/hermes-provider-venice.git@main"` to update from GitHub. Restart Hermes afterwards to load the new version.
 
 Add your API key (create one at [https://venice.ai/settings/api](https://venice.ai/settings/api)):
 

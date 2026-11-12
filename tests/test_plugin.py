@@ -105,8 +105,9 @@ def test_fetch_models_filters_non_text_and_offline_entries(
         def __exit__(self, *_args):
             return None
 
-        def read(self) -> bytes:
-            return json.dumps(payload).encode()
+        def read(self, size: int = -1) -> bytes:
+            body = json.dumps(payload).encode()
+            return body if size < 0 else body[:size]
 
     security = types.ModuleType("hermes_cli.urllib_security")
     security.open_credentialed_url = lambda *_args, **_kwargs: Response()
@@ -125,6 +126,96 @@ def test_fetch_models_filters_non_text_and_offline_entries(
             "completion": "0.000004",
         },
     }
+
+
+def _install_fake_opener(
+    monkeypatch: pytest.MonkeyPatch, body: bytes
+) -> list[types.SimpleNamespace]:
+    """Serve *body* for every catalog fetch and record each request's URL and auth header."""
+    requests: list[types.SimpleNamespace] = []
+
+    class Response:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return None
+
+        def read(self, size: int = -1) -> bytes:
+            return body if size < 0 else body[:size]
+
+    def open_credentialed_url(req, **_kwargs):
+        requests.append(
+            types.SimpleNamespace(
+                url=req.full_url, authorization=req.get_header("Authorization")
+            )
+        )
+        return Response()
+
+    security = types.ModuleType("hermes_cli.urllib_security")
+    security.open_credentialed_url = open_credentialed_url
+    hermes_cli = types.ModuleType("hermes_cli")
+    hermes_cli.urllib_security = security
+    monkeypatch.setitem(sys.modules, "hermes_cli", hermes_cli)
+    monkeypatch.setitem(sys.modules, "hermes_cli.urllib_security", security)
+    return requests
+
+
+_TOOL_MODEL_CATALOG = json.dumps(
+    {
+        "data": [
+            {
+                "id": "tool-model",
+                "type": "text",
+                "model_spec": {"capabilities": {"supportsFunctionCalling": True}},
+            }
+        ]
+    }
+).encode()
+
+
+@pytest.mark.parametrize(
+    "base_url",
+    [
+        "https://api.venice.ai/api/v1",
+        "http://localhost:8080/v1",
+        "http://127.0.0.1:8080/v1",
+        "http://[::1]:8080/v1",
+    ],
+)
+def test_catalog_fetch_sends_key_over_https_and_loopback(
+    plugin, monkeypatch: pytest.MonkeyPatch, base_url: str
+) -> None:
+    module, _ = plugin
+    requests = _install_fake_opener(monkeypatch, _TOOL_MODEL_CATALOG)
+
+    assert module.venice.fetch_models(api_key="secret", base_url=base_url) == [
+        "tool-model"
+    ]
+    assert requests[0].authorization == "Bearer secret"
+
+
+def test_catalog_fetch_withholds_key_over_plain_http(
+    plugin, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    module, _ = plugin
+    requests = _install_fake_opener(monkeypatch, _TOOL_MODEL_CATALOG)
+
+    assert module.venice.fetch_models(
+        api_key="secret", base_url="http://proxy.example.com/v1"
+    ) == ["tool-model"]
+    assert requests[0].url == "http://proxy.example.com/v1/models?type=text"
+    assert requests[0].authorization is None
+
+
+def test_catalog_fetch_rejects_oversized_response(
+    plugin, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    module, _ = plugin
+    monkeypatch.setattr(module, "_MAX_CATALOG_BYTES", len(_TOOL_MODEL_CATALOG) - 1)
+    _install_fake_opener(monkeypatch, _TOOL_MODEL_CATALOG)
+
+    assert module.venice.fetch_models(api_key="secret") is None
 
 
 def test_reasoning_uses_supported_effort_and_clamps(plugin) -> None:
@@ -500,6 +591,21 @@ def test_release_versions_stay_synchronized(plugin) -> None:
     )
 
     assert module.__version__ == project_version == manifest_version
+
+
+def test_github_links_use_the_owning_account() -> None:
+    root = Path(__file__).resolve().parents[1]
+    sources = [
+        root / "README.md",
+        root / "pyproject.toml",
+        root / "src/hermes_provider_venice/__main__.py",
+    ]
+    for path in sources:
+        text = path.read_text(encoding="utf-8")
+        assert "github.com/joshua-mo/" not in text, path
+    assert "github.com/joshua-mo-143/hermes-provider-venice" in (
+        root / "pyproject.toml"
+    ).read_text(encoding="utf-8")
 
 
 def test_compatibility_installer_copies_plugin_files(
