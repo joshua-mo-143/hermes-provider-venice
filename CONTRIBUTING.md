@@ -32,6 +32,9 @@ uv run ruff format --check .
 uv build --clear
 ```
 
+With a Hermes checkout, also run the plugin catalog check from
+[`DEVELOPMENT.md`](DEVELOPMENT.md).
+
 For optional end-to-end testing, install the provider into a temporary
 `HERMES_HOME` and use your own `VENICE_API_KEY`. Never put credentials in test
 output, commits, issues, or pull requests.

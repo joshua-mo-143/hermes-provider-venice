@@ -4,7 +4,8 @@
 
 - Python 3.12 or newer
 - [uv](https://docs.astral.sh/uv/)
-- A local Hermes Agent checkout for integration testing
+- A local Hermes Agent 0.22.6 or newer checkout for integration testing and
+  the catalog check
 - A Venice API key for optional live tests
 
 ## Set up
@@ -25,6 +26,17 @@ uv run ruff format --check .
 
 Automated tests mock network access and do not require an API key.
 
+## Set up Hermes
+
+PyPI stops at Hermes 0.19.0, so test against a release checkout. Hermes
+releases need Python 3.14 and their own lockfile:
+
+```bash
+git clone --depth 1 --branch v0.23.1 \
+  https://github.com/NousResearch/hermes-agent ../hermes-agent
+(cd ../hermes-agent && uv sync --frozen --no-dev --python 3.14)
+```
+
 ## Test with a local Hermes checkout
 
 Set the path to Hermes Agent and create an isolated Hermes home so development
@@ -39,7 +51,7 @@ HERMES_HOME="$TEST_HERMES_HOME" \
   uv run hermes-provider-venice install
 
 HERMES_HOME="$TEST_HERMES_HOME" \
-  uv run --project "$HERMES_REPO" python - <<'PY'
+  "$HERMES_REPO/.venv/bin/python" - <<'PY'
 from providers import get_provider_profile
 
 profile = get_provider_profile("venice")
@@ -61,7 +73,7 @@ export VENICE_API_KEY
 
 HERMES_HOME="$TEST_HERMES_HOME" \
 VENICE_API_KEY="$VENICE_API_KEY" \
-  uv run --project "$HERMES_REPO" hermes \
+  "$HERMES_REPO/.venv/bin/hermes" \
   -z "Reply with exactly: VENICE_LIVE_OK" \
   --provider venice \
   -m zai-org-glm-5-2
@@ -90,6 +102,23 @@ PY
 
 Use the isolated-directory method above when testing Hermes versions that do
 not yet support the dedicated `hermes_agent.model_providers` entry point.
+
+## Run the plugin catalog check
+
+The Hermes plugin catalog clones the repository at a commit and runs
+`hermes plugins validate` on the plugin directory. Run the same check on your
+last commit (uncommitted changes are not included):
+
+```bash
+export CATALOG_CHECK="$(mktemp -d)"
+git archive HEAD | tar -x -C "$CATALOG_CHECK"
+
+HERMES_HOME="$(mktemp -d)" \
+  "$HERMES_REPO/.venv/bin/hermes" plugins validate \
+  "$CATALOG_CHECK/src/hermes_provider_venice" --install-deps
+```
+
+Every check must pass, and there should be no warnings: a reviewer reads them.
 
 ## Build locally
 

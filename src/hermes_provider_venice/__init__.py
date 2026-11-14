@@ -3,68 +3,53 @@
 Venice is an OpenAI-compatible inference API
 (https://api.venice.ai/api/v1). See https://docs.venice.ai.
 
-Hermes can load this module from a Python package entry point or from
-``$HERMES_HOME/plugins/model-providers/venice/``.
+Hermes loads this module from a plugin directory (a ``hermes plugins install``
+clone, or ``$HERMES_HOME/plugins/model-providers/venice/``) or from a Python
+package entry point.
 
 Hermes integration
 ------------------
-Most provider behaviour is declared through :class:`VeniceProfile`, which
-subclasses Hermes's ``ProviderProfile`` and overrides the documented request
-hooks (``build_extra_body``, ``build_api_kwargs_extras``, ``fetch_models``).
-That covers everything Hermes routes *through the provider object*.
+The plugin extends Hermes only through documented ``ProviderProfile`` hooks
+and never patches Hermes modules, which the Hermes plugin catalog requires:
 
-The remaining integration points — context-window, cost, model-picker pricing,
-and capability lookups — are resolved by Hermes through provider-agnostic,
-module-level functions (``agent.models_dev``, ``agent.usage_pricing``,
-``hermes_cli.models``) that key off a static catalog (models.dev) and never
-consult the provider plugin. Venice is not in that catalog, and its ``/models``
-response uses shapes those resolvers cannot parse (per-million ``{usd, diem}``
-pricing objects, ``model_spec`` capability flags). Rather than fork Hermes, we
-wrap those four functions so Venice routes resolve from Venice's own live
-catalog.
+* ``build_extra_body`` and ``build_api_kwargs_extras`` shape each request.
+* ``fetch_models`` lists online, tool-capable text models.
+* ``live_context_length`` reports each model's context window.
+* ``get_usage_cost`` prices usage from Venice's per-model token rates.
+* ``model_capabilities`` carries per-model tool, vision and reasoning flags.
+* ``invalidate_catalog_cache`` supports ``/model --refresh``.
 
-Every ``_install_*_patch`` helper follows the same contract, so the patching
-stays predictable despite touching Hermes internals:
-
-* **Import-guarded** — a missing Hermes module is a no-op, keeping the package
-  importable outside a Hermes environment (metadata, the compatibility
-  installer, and tests all rely on this).
-* **Idempotent** — the wrapper is tagged with a sentinel attribute and skipped
-  if already applied, so repeated registration (import + ``register()``) wraps
-  each target exactly once.
-* **Venice-scoped and transparent** — the wrapper only intercepts Venice
-  routes (see :func:`_is_venice_provider` / :func:`_is_venice_endpoint`) and
-  delegates to the original function for every other provider and for any
-  Venice model it cannot resolve.
-
-The patches are installed at import time and again from :func:`register`.
+Model metadata comes from Venice's live ``GET /models`` catalog, cached in
+memory per base URL. Hooks that Hermes calls on every request read only that
+cache: when it is cold or stale they start a background refresh and answer
+from what is cached, so a slow or failing catalog never delays a request.
 """
 
 from __future__ import annotations
 
-import os
+import json
+import logging
+import threading
 import time
-from datetime import datetime, timezone
+import urllib.request
+from collections.abc import Mapping
+from datetime import UTC, datetime
 from decimal import Decimal, InvalidOperation
-from functools import wraps
-from typing import Any
+from typing import Any, NamedTuple
 from urllib.parse import urlparse
 
 __version__ = "0.2.2"
 
+logger = logging.getLogger(__name__)
+
 _CATALOG_TTL_SECONDS = 300.0
+# After a failed fetch, wait this long before asking Venice again.
+_CATALOG_RETRY_SECONDS = 60.0
+_CATALOG_TIMEOUT_SECONDS = 8.0
 # The live text catalog is under 200 KB; anything far larger is not a catalog.
 _MAX_CATALOG_BYTES = 8 * 1024 * 1024
-_catalog_cache: dict[str, tuple[float, dict[str, dict[str, Any]]]] = {}
 
-# Venice reports token prices per million tokens; Hermes stores catalog
-# pricing per token, so this factor converts between the two.
-_ONE_MILLION = Decimal(1_000_000)
-
-# Provider names/aliases that resolve to Venice inside Hermes.
-_VENICE_PROVIDER_NAMES = frozenset(
-    {"venice", "venice-ai", "veniceai", "venice.ai", "api.venice.ai"}
-)
+_SUBCENT = Decimal("0.01")
 
 # Venice appends its own default system prompts unless disabled. Hermes
 # already ships a full agent system prompt, so we turn Venice's off by
@@ -84,26 +69,39 @@ _REASONING_EFFORT_ORDER = (
 )
 
 
+class _Catalog(NamedTuple):
+    models: dict[str, dict[str, Any]]
+    fetched_at: float  # time.monotonic()
+    fetched_on: datetime
+
+
+_cache_lock = threading.Lock()
+_catalogs: dict[str, _Catalog] = {}
+# Base URL -> (time.monotonic() of the failure, whether the request had a key).
+_failures: dict[str, tuple[float, bool]] = {}
+_refreshing: set[str] = set()
+
+
+class _NoRedirect(urllib.request.HTTPRedirectHandler):
+    # Never follow redirects, so the API key is never forwarded to another host.
+    def redirect_request(
+        self,
+        req: urllib.request.Request,
+        fp: Any,
+        code: int,
+        msg: str,
+        headers: Any,
+        newurl: str,
+    ) -> None:
+        return None
+
+
+_OPENER = urllib.request.build_opener(_NoRedirect)
+
+
 def _catalog_key(base_url: str) -> str:
     """Normalise a base URL into the key used for the catalog cache."""
     return base_url.strip().rstrip("/")
-
-
-def _is_venice_endpoint(base_url: str) -> bool:
-    """Return ``True`` when *base_url* points at Venice.
-
-    Matches the user's ``VENICE_BASE_URL`` override exactly, otherwise falls
-    back to a ``venice.ai`` hostname check so custom base URLs still resolve.
-    """
-    normalized = _catalog_key(base_url)
-    configured = _catalog_key(os.environ.get("VENICE_BASE_URL", ""))
-    if configured and normalized == configured:
-        return True
-    try:
-        hostname = (urlparse(normalized).hostname or "").lower()
-    except ValueError:
-        return False
-    return hostname == "venice.ai" or hostname.endswith(".venice.ai")
 
 
 def _can_send_credentials(base_url: str) -> bool:
@@ -128,9 +126,21 @@ def _can_send_credentials(base_url: str) -> bool:
     )
 
 
-def _is_venice_provider(provider: str | None) -> bool:
-    """Return ``True`` for the Venice provider id or any of its aliases."""
-    return (provider or "").strip().lower() in _VENICE_PROVIDER_NAMES
+def _is_positive_int(value: Any) -> bool:
+    return isinstance(value, int) and not isinstance(value, bool) and value > 0
+
+
+def _retry_blocked(
+    failure: tuple[float, bool] | None, *, has_key: bool, now: float
+) -> bool:
+    """Return ``True`` when a recent failed fetch rules out asking again yet.
+
+    A failure without a key does not block a request that has one.
+    """
+    if failure is None:
+        return False
+    failed_at, failed_with_key = failure
+    return now - failed_at < _CATALOG_RETRY_SECONDS and (failed_with_key or not has_key)
 
 
 def _price_per_token(value: Any) -> str | None:
@@ -154,9 +164,9 @@ def _price_per_token(value: Any) -> str | None:
 def _parse_pricing(model_spec: dict[str, Any]) -> dict[str, str]:
     """Extract per-token pricing from a model's ``model_spec.pricing`` block.
 
-    Maps Venice's price keys onto the ``prompt`` / ``completion`` /
-    ``cache_read`` / ``cache_write`` names the rest of this module (and
-    Hermes) expect. Returns an empty dict when no pricing is present.
+    Maps Venice's price keys onto ``prompt`` / ``completion`` /
+    ``cache_read`` / ``cache_write``. Returns an empty dict when no pricing
+    is present.
     """
     raw_pricing = model_spec.get("pricing")
     if not isinstance(raw_pricing, dict):
@@ -180,9 +190,9 @@ def _parse_pricing(model_spec: dict[str, Any]) -> dict[str, str]:
 def _parse_catalog(payload: Any) -> dict[str, dict[str, Any]]:
     """Normalise a ``GET /models`` response into a catalog keyed by model id.
 
-    Skips non-text and offline models and flattens the fields the profile and
-    the Hermes patches consume (capabilities, context length, max completion
-    tokens, per-token pricing). Malformed payloads yield an empty dict.
+    Skips non-text and offline models and flattens the fields the profile
+    consumes (capabilities, context length, per-token pricing). Malformed
+    payloads yield an empty dict.
     """
     data = payload.get("data") if isinstance(payload, dict) else None
     if not isinstance(data, list):
@@ -214,13 +224,50 @@ def _parse_catalog(payload: Any) -> dict[str, dict[str, Any]]:
             "capabilities": capabilities,
             "context_length": raw_model.get("context_length")
             or model_spec.get("availableContextTokens"),
-            "max_completion_tokens": model_spec.get("maxCompletionTokens"),
             "pricing": _parse_pricing(model_spec),
         }
         normalized_id = model_id.strip()
         catalog[normalized_id] = metadata
 
     return catalog
+
+
+def _lookup(
+    models: dict[str, dict[str, Any]] | None, model: str | None
+) -> dict[str, Any] | None:
+    """Return one model's metadata, or ``None`` if not found.
+
+    Tries the exact id first, then the bare id after a ``vendor/`` prefix, so
+    callers can pass either form.
+    """
+    if not models or not model:
+        return None
+    return models.get(model) or models.get(model.split("/", 1)[-1])
+
+
+def _effort_options(metadata: dict[str, Any] | None) -> list[str]:
+    """Return the reasoning-effort levels a model accepts.
+
+    Reads the catalog's ``supportsReasoningEffort`` and
+    ``reasoningEffortOptions`` capability fields. Returns an empty list for
+    unknown models and for models that either lack reasoning entirely or
+    reason with a fixed, non-configurable budget — those 400 when sent any
+    effort parameter, so callers must not pass one.
+    """
+    capabilities = (metadata or {}).get("capabilities") or {}
+    if capabilities.get("supportsReasoningEffort") is not True:
+        return []
+
+    options = capabilities.get("reasoningEffortOptions")
+    if not isinstance(options, list):
+        return []
+
+    normalized: list[str] = []
+    for option in options:
+        value = str(option).strip().lower()
+        if value in _REASONING_EFFORT_ORDER and value not in normalized:
+            normalized.append(value)
+    return normalized
 
 
 def _clamp_reasoning_effort(effort: str, options: Any) -> str | None:
@@ -260,6 +307,100 @@ def _clamp_reasoning_effort(effort: str, options: Any) -> str | None:
     )
 
 
+def _model_capabilities(
+    models: dict[str, dict[str, Any]],
+) -> dict[str, dict[str, Any]]:
+    """Map catalog entries onto Hermes's ``model_overrides`` capability schema.
+
+    Flags the catalog does not report are left out, so Hermes treats them as
+    unknown rather than false.
+    """
+    flags = (
+        ("supportsFunctionCalling", "supports_tools"),
+        ("supportsVision", "supports_vision"),
+        ("supportsReasoning", "supports_reasoning"),
+    )
+    result: dict[str, dict[str, Any]] = {}
+    for model_id, metadata in models.items():
+        capabilities = metadata.get("capabilities") or {}
+        entry: dict[str, Any] = {
+            target: capabilities[source]
+            for source, target in flags
+            if isinstance(capabilities.get(source), bool)
+        }
+        if _is_positive_int(metadata.get("context_length")):
+            entry["context_window"] = metadata["context_length"]
+        if entry:
+            result[model_id] = entry
+    return result
+
+
+def _usage_cost_usd(pricing: dict[str, str], usage: Any) -> Decimal | None:
+    """Price one response's token usage from per-token rates, as Hermes does.
+
+    Returns ``None`` when tokens of some kind were used but the model has no
+    rate for them, so the cost reads as unknown rather than too low.
+    """
+    amount = Decimal(0)
+    for tokens_field, rate_key in (
+        ("input_tokens", "prompt"),
+        ("output_tokens", "completion"),
+        ("cache_read_tokens", "cache_read"),
+        ("cache_write_tokens", "cache_write"),
+    ):
+        tokens = getattr(usage, tokens_field, 0) or 0
+        rate = pricing.get(rate_key)
+        if rate is None:
+            if tokens:
+                return None
+            continue
+        try:
+            amount += Decimal(tokens) * Decimal(rate)
+        except (InvalidOperation, TypeError, ValueError):
+            return None
+    return amount
+
+
+def _cost_label(amount: Decimal) -> str:
+    """Format a cost the way Hermes does: ``$0.00``, ``~$0.0046`` or ``~$1.23``."""
+    if amount == 0:
+        return "$0.00"
+    if amount < _SUBCENT:
+        label = f"~${amount:.4f}"
+        return label if label != "~$0.0000" else "~$<0.0001"
+    return f"~${amount:.2f}"
+
+
+def _fetch(
+    base_url: str,
+    api_key: str | None,
+    headers: Mapping[str, str] | None,
+    timeout: float,
+) -> dict[str, dict[str, Any]] | None:
+    """Fetch and parse ``GET {base_url}/models?type=text``.
+
+    Sends the API key only to HTTPS or loopback base URLs. Returns ``None`` on
+    any network or parse failure, or for responses over
+    :data:`_MAX_CATALOG_BYTES`.
+    """
+    request = urllib.request.Request(f"{base_url}/models?type=text")
+    if api_key and _can_send_credentials(base_url):
+        request.add_header("Authorization", f"Bearer {api_key}")
+    request.add_header("Accept", "application/json")
+    for key, value in (headers or {}).items():
+        request.add_header(key, value)
+
+    try:
+        with _OPENER.open(request, timeout=timeout) as response:
+            raw = response.read(_MAX_CATALOG_BYTES + 1)
+        if len(raw) > _MAX_CATALOG_BYTES:
+            raise ValueError("Venice catalog response is too large")
+        return _parse_catalog(json.loads(raw.decode("utf-8")))
+    except Exception as exc:
+        logger.debug("Venice catalog fetch from %s failed: %s", base_url, exc)
+        return None
+
+
 venice: Any | None = None
 
 try:
@@ -274,218 +415,128 @@ else:
     class VeniceProfile(ProviderProfile):
         """Venice AI — OpenAI-compat chat with venice_parameters extras."""
 
+        def _base(self, base_url: str | None) -> str:
+            return _catalog_key(base_url or self.base_url or "")
+
+        def _api_key(self) -> str | None:
+            """Return the Venice API key for the active Hermes profile, if any."""
+            try:
+                from agent.secret_scope import UnscopedSecretError, get_secret
+            except ImportError:
+                return None
+            try:
+                return get_secret("VENICE_API_KEY") or None
+            except UnscopedSecretError:
+                return None
+
         def _fetch_catalog(
             self,
             *,
             api_key: str | None = None,
             base_url: str | None = None,
-            timeout: float = 8.0,
+            timeout: float = _CATALOG_TIMEOUT_SECONDS,
             force_refresh: bool = False,
         ) -> dict[str, dict[str, Any]] | None:
-            """Return the parsed Venice model catalog, cached per base URL.
+            """Return the catalog for *base_url*, fetching it when stale.
 
-            Serves a cached catalog within :data:`_CATALOG_TTL_SECONDS` (an
-            unauthenticated cached result is reused for authenticated callers,
-            but not vice versa) and otherwise fetches ``GET /models?type=text``.
-            Network or parse failures, and responses over
-            :data:`_MAX_CATALOG_BYTES`, are cached as empty and surface as
-            ``None`` so callers fall back to their defaults. The API key is
-            only sent to HTTPS or loopback base URLs.
+            Blocks on the network, so only hooks that may do I/O call it.
+            Serves a cached catalog younger than :data:`_CATALOG_TTL_SECONDS`.
+            After a failed fetch it waits :data:`_CATALOG_RETRY_SECONDS` before
+            asking again, and meanwhile returns the last good catalog, if any.
             """
-            effective_base = _catalog_key(base_url or self.base_url or "")
-            if not effective_base:
+            base = self._base(base_url)
+            if not base:
                 return None
-            if api_key and not _can_send_credentials(effective_base):
+            if api_key and not _can_send_credentials(base):
                 api_key = None
 
-            cached = _catalog_cache.get(effective_base)
+            with _cache_lock:
+                cached = _catalogs.get(base)
+                failure = _failures.get(base)
             now = time.monotonic()
+            if not force_refresh:
+                if cached and now - cached.fetched_at < _CATALOG_TTL_SECONDS:
+                    return cached.models
+                if _retry_blocked(failure, has_key=bool(api_key), now=now):
+                    return cached.models if cached else None
+
+            models = _fetch(base, api_key, self.default_headers, timeout)
+            with _cache_lock:
+                if models is None:
+                    _failures[base] = (time.monotonic(), bool(api_key))
+                else:
+                    _catalogs[base] = _Catalog(
+                        models, time.monotonic(), datetime.now(UTC)
+                    )
+                    _failures.pop(base, None)
+            if models is None:
+                return cached.models if cached else None
+
+            # Older Hermes releases have no model_capabilities field.
+            capabilities = getattr(self, "model_capabilities", None)
+            if isinstance(capabilities, dict):
+                capabilities.update(_model_capabilities(models))
+            return models
+
+        def _cached_catalog(self, base_url: str | None) -> dict[str, dict[str, Any]]:
+            """Return the cached catalog for *base_url* without network I/O.
+
+            When the catalog is missing or stale, starts a background refresh
+            and returns what is cached (an empty dict when cold).
+            """
+            base = self._base(base_url)
+            if not base:
+                return {}
+            with _cache_lock:
+                cached = _catalogs.get(base)
             if (
-                cached
-                and now - cached[0] < _CATALOG_TTL_SECONDS
-                and (cached[1] or not api_key)
-                and not force_refresh
+                cached is None
+                or time.monotonic() - cached.fetched_at >= _CATALOG_TTL_SECONDS
             ):
-                return cached[1]
+                self._refresh_in_background(base)
+            return cached.models if cached else {}
 
-            import json
-            import urllib.request
+        def _refresh_in_background(self, base: str) -> None:
+            """Fetch *base*'s catalog on a daemon thread, one at a time per URL."""
+            api_key = self._api_key()
+            if api_key and not _can_send_credentials(base):
+                api_key = None
+            with _cache_lock:
+                if base in _refreshing or _retry_blocked(
+                    _failures.get(base), has_key=bool(api_key), now=time.monotonic()
+                ):
+                    return
+                _refreshing.add(base)
 
-            from hermes_cli.urllib_security import open_credentialed_url
-
-            req = urllib.request.Request(f"{effective_base}/models?type=text")
-            if api_key:
-                req.add_header("Authorization", f"Bearer {api_key}")
-            req.add_header("Accept", "application/json")
-            for key, value in (self.default_headers or {}).items():
-                req.add_header(key, value)
+            def refresh() -> None:
+                try:
+                    self._fetch_catalog(
+                        api_key=api_key, base_url=base, force_refresh=True
+                    )
+                finally:
+                    with _cache_lock:
+                        _refreshing.discard(base)
 
             try:
-                with open_credentialed_url(req, timeout=timeout) as resp:
-                    raw = resp.read(_MAX_CATALOG_BYTES + 1)
-                if len(raw) > _MAX_CATALOG_BYTES:
-                    raise ValueError("Venice catalog response is too large")
-                payload = json.loads(raw.decode("utf-8"))
-            except Exception:
-                _catalog_cache[effective_base] = (now, {})
-                return None
+                threading.Thread(
+                    target=refresh, name="venice-catalog-refresh", daemon=True
+                ).start()
+            except RuntimeError as exc:
+                logger.debug("Could not start the Venice catalog refresh: %s", exc)
+                with _cache_lock:
+                    _refreshing.discard(base)
 
-            catalog = _parse_catalog(payload)
-            _catalog_cache[effective_base] = (now, catalog)
-            return catalog or None
-
-        def _model_metadata(
-            self,
-            model: str | None,
-            *,
-            base_url: str | None = None,
-        ) -> dict[str, Any] | None:
-            """Return one model's catalog metadata, or ``None`` if not found.
-
-            Tries the exact id first, then the bare id after a ``vendor/``
-            prefix, so callers can pass either form.
-            """
-            if not model:
-                return None
-            catalog = self._fetch_catalog(
-                api_key=os.environ.get("VENICE_API_KEY"),
-                base_url=base_url,
-            )
-            if not catalog:
-                return None
-            return catalog.get(model) or catalog.get(model.split("/", 1)[-1])
-
-        def _live_pricing_entry(
-            self,
-            model: str | None,
-            *,
-            base_url: str | None = None,
-            api_key: str | None = None,
-        ) -> Any | None:
-            """Build a Hermes pricing entry from Venice's live per-million rates.
-
-            Venice publishes per-model token prices on ``GET /models``; the
-            parsed catalog stores them per token. Returns ``None`` when the
-            model is unknown or carries no usable token pricing, so callers can
-            fall back to Hermes's default pricing resolution.
-            """
-            if not model:
-                return None
-            catalog = self._fetch_catalog(
-                api_key=api_key or os.environ.get("VENICE_API_KEY"),
-                base_url=base_url,
-            )
-            if not catalog:
-                return None
-            metadata = catalog.get(model) or catalog.get(model.split("/", 1)[-1])
-            pricing = metadata.get("pricing") if metadata else None
-            if not pricing:
-                return None
-
-            from agent.usage_pricing import PricingEntry
-
-            def _per_million(value: str | None) -> Decimal | None:
-                if value is None:
-                    return None
-                try:
-                    return Decimal(value) * _ONE_MILLION
-                except (InvalidOperation, TypeError, ValueError):
-                    return None
-
-            input_cost = _per_million(pricing.get("prompt"))
-            output_cost = _per_million(pricing.get("completion"))
-            if input_cost is None and output_cost is None:
-                return None
-
-            effective_base = _catalog_key(base_url or self.base_url or "")
-            return PricingEntry(
-                input_cost_per_million=input_cost,
-                output_cost_per_million=output_cost,
-                cache_read_cost_per_million=_per_million(pricing.get("cache_read")),
-                cache_write_cost_per_million=_per_million(pricing.get("cache_write")),
-                source="provider_models_api",
-                source_url=f"{effective_base}/models" if effective_base else None,
-                pricing_version="venice-models-api",
-                fetched_at=datetime.now(timezone.utc),
-            )
-
-        def _catalog_pricing_map(
-            self,
-            *,
-            base_url: str | None = None,
-            api_key: str | None = None,
-            force_refresh: bool = False,
-        ) -> dict[str, dict[str, str]]:
-            """Return per-token pricing keyed by model, for Hermes model pickers.
-
-            Hermes's picker (CLI + desktop) renders pricing from a
-            ``{model: {prompt, completion, input_cache_read}}`` map of
-            per-token price strings, which is the shape Venice's catalog is
-            already parsed into.
-            """
-            catalog = self._fetch_catalog(
-                api_key=api_key or os.environ.get("VENICE_API_KEY"),
-                base_url=base_url or os.environ.get("VENICE_BASE_URL"),
-                force_refresh=force_refresh,
-            )
-            if not catalog:
-                return {}
-
-            result: dict[str, dict[str, str]] = {}
-            for model_id, metadata in catalog.items():
-                pricing = metadata.get("pricing") or {}
-                row: dict[str, str] = {}
-                if pricing.get("prompt") is not None:
-                    row["prompt"] = pricing["prompt"]
-                if pricing.get("completion") is not None:
-                    row["completion"] = pricing["completion"]
-                if pricing.get("cache_read") is not None:
-                    row["input_cache_read"] = pricing["cache_read"]
-                if row:
-                    result[model_id] = row
-            return result
-
-        def _hermes_model_capabilities(
-            self,
-            model: str | None,
-            *,
-            base_url: str | None = None,
-        ) -> Any | None:
-            """Map Venice's live capability flags to Hermes's ModelCapabilities.
-
-            Lets Hermes surfaces (the desktop model picker's reasoning toggle,
-            model-switch validation) reflect Venice's real per-model reasoning,
-            tool, vision, and context data instead of defaulting to unknown.
-            """
-            metadata = self._model_metadata(model, base_url=base_url)
-            if not metadata:
-                return None
-
-            from agent.models_dev import ModelCapabilities
-
-            capabilities = metadata.get("capabilities") or {}
-            kwargs: dict[str, Any] = {
-                "supports_tools": bool(
-                    capabilities.get("supportsFunctionCalling", True)
-                ),
-                "supports_vision": bool(capabilities.get("supportsVision")),
-                "supports_reasoning": bool(capabilities.get("supportsReasoning")),
-            }
-            context_length = metadata.get("context_length")
-            if (
-                isinstance(context_length, int)
-                and not isinstance(context_length, bool)
-                and context_length > 0
-            ):
-                kwargs["context_window"] = context_length
-            max_output = metadata.get("max_completion_tokens")
-            if (
-                isinstance(max_output, int)
-                and not isinstance(max_output, bool)
-                and max_output > 0
-            ):
-                kwargs["max_output_tokens"] = max_output
-            return ModelCapabilities(**kwargs)
+        def _any_cached(
+            self, model: str | None
+        ) -> tuple[dict[str, Any] | None, _Catalog | None]:
+            """Find *model* in any cached catalog, the default base URL's first."""
+            with _cache_lock:
+                catalogs = [_catalogs.get(self._base(None)), *_catalogs.values()]
+            for catalog in catalogs:
+                metadata = _lookup(catalog.models, model) if catalog else None
+                if metadata:
+                    return metadata, catalog
+            return None, None
 
         def build_extra_body(
             self, *, session_id: str | None = None, **context
@@ -505,36 +556,6 @@ else:
 
             return body
 
-        def reasoning_effort_options(
-            self,
-            model: str | None,
-            *,
-            base_url: str | None = None,
-        ) -> list[str]:
-            """Return the reasoning-effort levels a Venice model accepts.
-
-            Reads the live catalog's ``supportsReasoningEffort`` and
-            ``reasoningEffortOptions`` capability fields. Returns an empty list
-            for models that either lack reasoning entirely or reason with a
-            fixed, non-configurable budget — those 400 when sent any effort
-            parameter, so callers must not pass one.
-            """
-            metadata = self._model_metadata(model, base_url=base_url)
-            capabilities = metadata.get("capabilities", {}) if metadata else {}
-            if capabilities.get("supportsReasoningEffort") is not True:
-                return []
-
-            options = capabilities.get("reasoningEffortOptions")
-            if not isinstance(options, list):
-                return []
-
-            normalized: list[str] = []
-            for option in options:
-                value = str(option).strip().lower()
-                if value in _REASONING_EFFORT_ORDER and value not in normalized:
-                    normalized.append(value)
-            return normalized
-
         def build_api_kwargs_extras(
             self,
             *,
@@ -548,11 +569,15 @@ else:
             Returns a ``(extra_body, top_level_kwargs)`` pair. Disabling
             reasoning (or an explicit ``none`` effort) uses Venice's
             recommended ``reasoning.enabled: false`` toggle. An enabled effort
-            is emitted as top-level ``reasoning_effort`` only when the model
-            advertises effort support, clamped to a level it accepts;
+            is emitted as top-level ``reasoning_effort`` only when the catalog
+            says the model supports effort, clamped to a level it accepts;
             otherwise no reasoning kwargs are sent so fixed-budget and
             non-reasoning models do not 400.
+
+            Hermes calls this for every request, so it reads the catalog cache
+            only; until the cache is warm, no effort is sent.
             """
+            models = self._cached_catalog(base_url)
             if not isinstance(reasoning_config, dict):
                 return {}, {}
 
@@ -562,7 +587,7 @@ else:
             if not effort:
                 return {}, {}
 
-            options = self.reasoning_effort_options(model, base_url=base_url)
+            options = _effort_options(_lookup(models, model))
             if not options:
                 return {}, {}
 
@@ -576,179 +601,66 @@ else:
             *,
             api_key: str | None = None,
             base_url: str | None = None,
-            timeout: float = 8.0,
+            timeout: float = _CATALOG_TIMEOUT_SECONDS,
         ) -> list[str] | None:
             """Return online text models that can support an agent tool loop."""
-            catalog = self._fetch_catalog(
-                api_key=api_key,
+            models = self._fetch_catalog(
+                api_key=api_key or self._api_key(),
                 base_url=base_url,
                 timeout=timeout,
             )
-            if not catalog:
+            if not models:
                 return None
 
             return [
                 model_id
-                for model_id, metadata in catalog.items()
+                for model_id, metadata in models.items()
                 if metadata.get("capabilities", {}).get("supportsFunctionCalling")
                 is True
             ] or None
 
-    def _install_context_lookup_patch() -> None:
-        """Resolve Venice context windows via ``lookup_models_dev_context``.
+        def live_context_length(
+            self, model: str, *, api_key: str = "", base_url: str = ""
+        ) -> int | None:
+            """Return *model*'s context window from Venice's live catalog."""
+            models = self._fetch_catalog(
+                api_key=api_key or self._api_key(), base_url=base_url or None
+            )
+            metadata = _lookup(models, model)
+            context_length = metadata.get("context_length") if metadata else None
+            return context_length if _is_positive_int(context_length) else None
 
-        Hermes sizes context budgets from ``agent.models_dev`` (models.dev),
-        which does not list Venice. This wraps ``lookup_models_dev_context`` so
-        Venice models report their real context window from the live catalog.
-        See the module docstring for the shared patch contract.
-        """
-        try:
-            import agent.models_dev as models_dev
-        except ImportError:
-            return
+        def get_usage_cost(self, model: str, usage: Any) -> Any | None:
+            """Estimate a response's cost from Venice's per-model token rates.
 
-        original = getattr(models_dev, "lookup_models_dev_context", None)
-        if not callable(original):
-            return
-        if getattr(original, "_hermes_venice_context_patch", False):
-            return
+            Hermes calls this after every response, so it reads the catalog
+            cache only. Returns ``None`` when the model or a rate it needs is
+            unknown, which leaves the cost to Hermes's own pricing lookup.
+            """
+            metadata, catalog = self._any_cached(model)
+            pricing = metadata.get("pricing") if metadata else None
+            if not pricing or catalog is None:
+                return None
+            amount = _usage_cost_usd(pricing, usage)
+            if amount is None:
+                return None
 
-        @wraps(original)
-        def lookup_models_dev_context(provider: str, model: str) -> int | None:
-            if _is_venice_provider(provider):
-                metadata = venice._model_metadata(
-                    model,
-                    base_url=os.environ.get("VENICE_BASE_URL") or venice.base_url,
-                )
-                context_length = metadata.get("context_length") if metadata else None
-                if (
-                    isinstance(context_length, int)
-                    and not isinstance(context_length, bool)
-                    and context_length > 0
-                ):
-                    return context_length
-            return original(provider, model)
+            from agent.usage_pricing import CostResult
 
-        lookup_models_dev_context._hermes_venice_context_patch = True
-        models_dev.lookup_models_dev_context = lookup_models_dev_context
-
-    def _install_pricing_lookup_patch() -> None:
-        """Teach current Hermes releases to price Venice models from live rates.
-
-        Venice returns per-million token prices nested under
-        ``model_spec.pricing`` as ``{usd, diem}`` objects, a shape Hermes's
-        generic OpenAI-compatible pricing extractor cannot read. This wraps
-        ``agent.usage_pricing.get_pricing_entry`` so Venice routes report
-        accurate cost (session totals, the expensive-model guard, usage
-        reports) from the live catalog. See the module docstring for the
-        shared patch contract.
-        """
-        try:
-            import agent.usage_pricing as usage_pricing
-        except ImportError:
-            return
-
-        original = getattr(usage_pricing, "get_pricing_entry", None)
-        if not callable(original):
-            return
-        if getattr(original, "_hermes_venice_pricing_patch", False):
-            return
-
-        @wraps(original)
-        def get_pricing_entry(
-            model_name: str,
-            provider: str | None = None,
-            base_url: str | None = None,
-            api_key: str | None = None,
-        ) -> Any | None:
-            if _is_venice_provider(provider) or _is_venice_endpoint(base_url or ""):
-                entry = venice._live_pricing_entry(
-                    model_name,
-                    base_url=(
-                        base_url or os.environ.get("VENICE_BASE_URL") or venice.base_url
-                    ),
-                    api_key=api_key,
-                )
-                if entry is not None:
-                    return entry
-            return original(
-                model_name,
-                provider=provider,
-                base_url=base_url,
-                api_key=api_key,
+            return CostResult(
+                amount_usd=amount,
+                status="estimated",
+                source="provider_models_api",
+                label=_cost_label(amount),
+                fetched_at=catalog.fetched_on,
+                pricing_version="venice-models-api",
             )
 
-        get_pricing_entry._hermes_venice_pricing_patch = True
-        usage_pricing.get_pricing_entry = get_pricing_entry
-
-    def _install_picker_pricing_patch() -> None:
-        """Show Venice's live per-model pricing in Hermes model pickers.
-
-        The CLI and desktop pickers read pricing from
-        ``hermes_cli.models.get_pricing_for_provider``, which natively covers
-        only a few aggregators (not Venice). This wraps it to serve Venice's
-        catalog pricing so per-model rates render in the picker UI. This is a
-        separate code path from cost tracking (see
-        :func:`_install_pricing_lookup_patch`). See the module docstring for
-        the shared patch contract.
-        """
-        try:
-            import hermes_cli.models as cli_models
-        except ImportError:
-            return
-
-        original = getattr(cli_models, "get_pricing_for_provider", None)
-        if not callable(original):
-            return
-        if getattr(original, "_hermes_venice_picker_pricing_patch", False):
-            return
-
-        @wraps(original)
-        def get_pricing_for_provider(
-            provider: str, *, force_refresh: bool = False
-        ) -> dict[str, dict[str, str]]:
-            if _is_venice_provider(provider):
-                pricing = venice._catalog_pricing_map(force_refresh=force_refresh)
-                if pricing:
-                    return pricing
-            return original(provider, force_refresh=force_refresh)
-
-        get_pricing_for_provider._hermes_venice_picker_pricing_patch = True
-        cli_models.get_pricing_for_provider = get_pricing_for_provider
-
-    def _install_capabilities_patch() -> None:
-        """Teach Hermes to resolve Venice model capabilities from the catalog.
-
-        Wraps ``agent.models_dev.get_model_capabilities`` so the desktop
-        picker's per-model reasoning toggle and model-switch validation reflect
-        Venice's live ``supportsReasoning`` / tool / vision / context data
-        instead of the models.dev catalog, which does not list Venice. See the
-        module docstring for the shared patch contract.
-        """
-        try:
-            import agent.models_dev as models_dev
-        except ImportError:
-            return
-
-        original = getattr(models_dev, "get_model_capabilities", None)
-        if not callable(original):
-            return
-        if getattr(original, "_hermes_venice_capabilities_patch", False):
-            return
-
-        @wraps(original)
-        def get_model_capabilities(provider: str, model: str) -> Any | None:
-            if _is_venice_provider(provider):
-                caps = venice._hermes_model_capabilities(
-                    model,
-                    base_url=os.environ.get("VENICE_BASE_URL") or venice.base_url,
-                )
-                if caps is not None:
-                    return caps
-            return original(provider, model)
-
-        get_model_capabilities._hermes_venice_capabilities_patch = True
-        models_dev.get_model_capabilities = get_model_capabilities
+        def invalidate_catalog_cache(self) -> None:
+            """Drop cached catalogs so the next lookup fetches a fresh one."""
+            with _cache_lock:
+                _catalogs.clear()
+                _failures.clear()
 
     venice = VeniceProfile(
         name="venice",
@@ -785,19 +697,14 @@ else:
             "venice-uncensored-1-2",
             "qwen3-coder-480b-a35b-instruct-turbo",
             "qwen3-vl-235b-a22b",
-            # Still listed as Venice trait defaults (stable aliases)
+            # Previous generation, still served
             "zai-org-glm-4.7",
-            "zai-org-glm-4.7-flash",
             "qwen3-235b-a22b-thinking-2507",
         ),
     )
 
     # Directory plugins are registered by importing their __init__.py.
     register_provider(venice)
-    _install_context_lookup_patch()
-    _install_pricing_lookup_patch()
-    _install_picker_pricing_patch()
-    _install_capabilities_patch()
 
 
 def register(_context: object | None = None) -> None:
@@ -813,10 +720,6 @@ def register(_context: object | None = None) -> None:
             "same Python environment as Hermes Agent."
         )
     register_provider(venice)
-    _install_context_lookup_patch()
-    _install_pricing_lookup_patch()
-    _install_picker_pricing_patch()
-    _install_capabilities_patch()
 
 
 __all__ = ("__version__", "register", "venice")

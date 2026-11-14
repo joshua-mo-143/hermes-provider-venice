@@ -3,12 +3,17 @@
 Current Hermes releases can discover packaged plugins through entry points.
 For older releases, or when this package is installed outside Hermes's Python
 environment, this command copies the plugin into the user plugin directory.
+
+It lives outside the ``hermes_provider_venice`` plugin directory because the
+Hermes plugin catalog installs that directory and does not allow code that
+updates the plugin.
 """
 
 from __future__ import annotations
 
 import argparse
 import importlib.metadata
+import importlib.util
 import os
 import shutil
 import subprocess
@@ -16,6 +21,7 @@ import sys
 from pathlib import Path
 
 PLUGIN_NAME = "venice"
+PLUGIN_PACKAGE = "hermes_provider_venice"
 DISTRIBUTION_NAME = "hermes-provider-venice"
 
 
@@ -26,12 +32,15 @@ def _hermes_home() -> Path:
     return Path.home() / ".hermes"
 
 
-def _package_dir() -> Path:
-    return Path(__file__).resolve().parent
+def _plugin_dir() -> Path:
+    spec = importlib.util.find_spec(PLUGIN_PACKAGE)
+    if spec is None or spec.origin is None:
+        raise RuntimeError(f"{PLUGIN_PACKAGE} is not installed in this environment.")
+    return Path(spec.origin).resolve().parent
 
 
 def install(*, force: bool = False) -> Path:
-    src = _package_dir()
+    src = _plugin_dir()
     dest = _hermes_home() / "plugins" / "model-providers" / PLUGIN_NAME
     dest.parent.mkdir(parents=True, exist_ok=True)
 
@@ -45,12 +54,7 @@ def install(*, force: bool = False) -> Path:
     shutil.copytree(
         src,
         dest,
-        ignore=shutil.ignore_patterns(
-            "__pycache__",
-            "*.pyc",
-            "*.pyo",
-            "__main__.py",
-        ),
+        ignore=shutil.ignore_patterns("__pycache__", "*.pyc", "*.pyo"),
     )
     return dest
 
@@ -147,7 +151,7 @@ def main(argv: list[str] | None = None) -> None:
     if args.cmd == "install":
         try:
             dest = install(force=args.force)
-        except FileExistsError as exc:
+        except (FileExistsError, RuntimeError) as exc:
             print(exc, file=sys.stderr)
             sys.exit(1)
         print(f"Installed Venice provider → {dest}")
@@ -172,7 +176,3 @@ def main(argv: list[str] | None = None) -> None:
         print()
         print("Update complete. Restart Hermes to load the new version.")
         return
-
-
-if __name__ == "__main__":
-    main()
