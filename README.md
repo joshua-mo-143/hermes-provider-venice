@@ -6,14 +6,26 @@ Venice has a privacy-first OpenAI-compatible inference API. This package registe
 
 > **Disclaimer:** This is an independent, open source project. It is not officially maintained, endorsed, or supported by Venice AI.
 
+## Requirements
+
+Hermes Agent 0.22.6 or newer. Older Hermes releases still load the provider and route chat through it, but don't pick up its context windows, cost estimates or per-model capabilities. On those releases, upgrade Hermes or stay on hermes-provider-venice 0.2.1.
+
 ## Install
+
+With Hermes's plugin installer, straight from GitHub:
+
+```bash
+hermes plugins install joshua-mo-143/hermes-provider-venice#src/hermes_provider_venice
+```
+
+Or as a Python package, in the same environment as Hermes:
 
 ```bash
 # From PyPI:
 pip install hermes-provider-venice
 
 # From the latest GitHub main branch:
-pip install "git+https://github.com/joshua-mo/hermes-provider-venice.git@main"
+pip install "git+https://github.com/joshua-mo-143/hermes-provider-venice.git@main"
 
 # Or from this checkout:
 pip install .
@@ -35,9 +47,9 @@ To upgrade to the latest release later, run:
 hermes-provider-venice update
 ```
 
-This runs `pip install --upgrade` for the package in the current environment and, if the compatibility installer was used, refreshes the copy in `$HERMES_HOME`. Pass `--pre` to include pre-releases, or `--source "git+https://github.com/joshua-mo/hermes-provider-venice.git@main"` to update from GitHub. Restart Hermes afterwards to load the new version.
+This runs `pip install --upgrade` for the package in the current environment and, if the compatibility installer was used, refreshes the copy in `$HERMES_HOME`. Pass `--pre` to include pre-releases, or `--source "git+https://github.com/joshua-mo-143/hermes-provider-venice.git@main"` to update from GitHub. Restart Hermes afterwards to load the new version.
 
-Add your API key (create one at [https://venice.ai/settings/api](https://venice.ai/settings/api)):
+Add your API key (create one at [https://venice.ai/settings/api](https://venice.ai/settings/api)). `hermes plugins install` asks for it if it isn't set; otherwise add it yourself:
 
 ```bash
 # ~/.hermes/.env
@@ -85,9 +97,19 @@ Full catalog: `https://api.venice.ai/api/v1/models?type=text` or [https://docs.v
 - Passes `prompt_cache_key` from the Hermes session id for better cache locality
 - Filters the live catalog to online, text, tool-capable models
 - Resolves each model's context window from Venice's live catalog
-- Injects live per-token pricing from Venice's catalog into Hermes's cost tracking so session cost, the expensive-model guard, and usage reports work for Venice models (Venice reports per-million USD rates that Hermes's generic OpenAI-compatible pricing parser cannot read)
-- Surfaces the same live pricing and per-model capabilities (reasoning, tools, vision, context) in Hermes's model pickers, including the desktop UI's price column and reasoning toggle
+- Estimates the cost of each response from Venice's per-model token prices, which Hermes's generic OpenAI-compatible pricing parser cannot read (Venice publishes per-million rates as `{usd, diem}` objects)
+- Gives Hermes each model's tool, vision and reasoning support, which feeds the model picker's badges and image routing
 - Maps Hermes reasoning controls to Venice's recommended disable and model-supported effort parameters, clamping unsupported effort levels and omitting effort entirely for models that reason with a fixed budget
+
+Everything goes through Hermes's documented provider hooks; the plugin doesn't patch Hermes. Hermes has no provider hook yet for the model picker's price column or for the confirmation it shows before switching to an expensive model, so neither uses Venice prices.
+
+## Privacy and network access
+
+- Hermes sends your prompts, tool definitions, tool results and `VENICE_API_KEY` to `api.venice.ai`, or to `VENICE_BASE_URL` if you set it.
+- Venice's catalog marks each model as `private` or `anonymized`. Venice passes requests for anonymized models, such as the Claude, GPT and Gemini models, on to the company that serves them. See the [Venice documentation](https://docs.venice.ai) for details.
+- The plugin itself downloads Venice's model catalog (`GET /models?type=text`) with your key when Hermes lists models or looks up a context window. It also downloads it when Hermes sends a request and the cached copy is missing or more than five minutes old; that download runs on a short-lived background thread so the request doesn't wait.
+- The catalog is kept in memory only. The key is sent only over HTTPS or to a loopback address, and catalog requests never follow redirects.
+- The plugin collects no telemetry and doesn't read or write files. The separate `hermes-provider-venice` command, available only in the PyPI package, copies the plugin into `$HERMES_HOME`, and its `update` subcommand runs pip to download a newer release.
 
 ## Develop
 
@@ -98,6 +120,10 @@ Contributions are described in [`CONTRIBUTING.md`](CONTRIBUTING.md).
 ## Uninstall
 
 ```bash
+# Installed with hermes plugins install:
+hermes plugins remove venice
+
+# Installed with the compatibility installer:
 rm -rf ~/.hermes/plugins/model-providers/venice
 # optionally: uv tool uninstall hermes-provider-venice
 ```

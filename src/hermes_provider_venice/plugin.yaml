@@ -1,5 +1,11 @@
 name: venice
 kind: model-provider
-version: 0.2.1
+version: 0.2.2
 description: Venice AI — Privacy-first, OpenAI-compatible inference
 author: Joshua Mo
+requires_hermes: ">=0.22.6"
+requires_env:
+  - name: VENICE_API_KEY
+    description: Venice API key
+    url: https://venice.ai/settings/api
+    secret: true
